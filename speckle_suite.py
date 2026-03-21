@@ -3477,6 +3477,7 @@ class ClickableLineEdit(QLineEdit):
 
 class ClickableImageView(pg.ImageView):
     clicked = pyqtSignal(float, float)
+    hovered = pyqtSignal(float, float)
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.MouseButton.LeftButton:
@@ -3484,6 +3485,17 @@ class ClickableImageView(pg.ImageView):
             pos = vb.mapSceneToView(ev.position())
             self.clicked.emit(pos.x(), pos.y())
         super().mousePressEvent(ev)
+
+    def _connect_hover(self):
+        """Call once after the widget is shown to wire scene mouse-move signal."""
+        scene = self.getView().scene()
+        scene.sigMouseMoved.connect(self._on_scene_mouse_moved)
+
+    def _on_scene_mouse_moved(self, scene_pos):
+        vb  = self.getView()
+        if vb.sceneBoundingRect().contains(scene_pos):
+            pos = vb.mapSceneToView(scene_pos)
+            self.hovered.emit(pos.x(), pos.y())
 
 
 class AnalysisTab(QWidget):
@@ -3521,6 +3533,10 @@ class AnalysisTab(QWidget):
         self._nav_paths:    list = []
         self._nav_idx:      int  = 0
         self._nav_memory:   dict = {}
+        # cursor circle & background
+        self._cursor_circle_item: object = None
+        self._cursor_last_pos: Optional[tuple] = None
+        self._bg_level: Optional[float] = None
         self._build_ui()
 
     # ── UI ─────────────────────────────────────────────────────────────────
@@ -3823,6 +3839,34 @@ class AnalysisTab(QWidget):
         self.clear_btn.clicked.connect(self._clear_all)
         detect_layout.addWidget(self.clear_btn)
 
+        # Cursor circle + background subtraction (single row)
+        cursor_row = QHBoxLayout(); cursor_row.setSpacing(6)
+        cursor_lbl = QLabel("Cursor r:")
+        cursor_lbl.setStyleSheet("font-size:10px;")
+        self.cursor_radius_spin = QSpinBox()
+        self.cursor_radius_spin.setRange(1, 60)
+        self.cursor_radius_spin.setValue(7)
+        self.cursor_radius_spin.setSuffix(" px")
+        self.cursor_radius_spin.setFixedWidth(62)
+        self.cursor_radius_spin.setToolTip("Radius of the cursor aperture circle (image pixels)")
+        self.cursor_radius_spin.valueChanged.connect(self._on_cursor_radius_changed)
+        self.bg_sample_btn = QPushButton("Sample BG")
+        self.bg_sample_btn.setCheckable(True)
+        self.bg_sample_btn.setEnabled(False)
+        self.bg_sample_btn.setToolTip(
+            "When active, the next click samples the background level "
+            "inside the cursor circle at a signal-free region")
+        self.bg_subtract_chk = QCheckBox("- BG")
+        self.bg_subtract_chk.setEnabled(False)
+        self.bg_subtract_chk.setToolTip("Subtract the sampled background from the displayed image")
+        self.bg_subtract_chk.toggled.connect(self._on_bg_subtract_toggled)
+        cursor_row.addWidget(cursor_lbl)
+        cursor_row.addWidget(self.cursor_radius_spin)
+        cursor_row.addWidget(self.bg_sample_btn)
+        cursor_row.addWidget(self.bg_subtract_chk)
+        cursor_row.addStretch()
+        detect_layout.addLayout(cursor_row)
+
         left_layout.addWidget(detect_group)
         left_layout.addWidget(cards_group)
         left_layout.addStretch()
@@ -3879,7 +3923,29 @@ class AnalysisTab(QWidget):
         self.recon_view.ui.menuBtn.hide()
         self.recon_view.ui.histogram.hide()
         self.recon_view.clicked.connect(self._on_recon_click)
+        self.recon_view.hovered.connect(self._on_recon_hover)
+        self.bg_sample_btn.clicked.connect(self._on_bg_sample_clicked)
+        # Wire scene mouse-move after widget is fully constructed
+        QTimer.singleShot(0, self.recon_view._connect_hover)
         recon_layout.addWidget(self.recon_view)
+
+        # Save image button
+        img_btn_row = QHBoxLayout()
+        img_btn_row.setSpacing(6)
+        self.nav_sum_btn = QPushButton("Σ Sum all")
+        self.nav_sum_btn.setCheckable(True)
+        self.nav_sum_btn.setEnabled(False)
+        self.nav_sum_btn.setToolTip("Display the reconstruction from the sum of all loaded NPZ bispectra")
+        self.nav_sum_btn.setStyleSheet(
+            f"QPushButton {{ background:{PANEL_BG}; border:1px solid {BORDER_COLOR}; "            f"border-radius:4px; padding:6px 14px; color:{TEXT_PRIMARY}; font-weight:bold; }}"            f"QPushButton:checked {{ background:{ACCENT}; color:{DARK_BG}; border-color:{ACCENT}; }}"            f"QPushButton:disabled {{ background:{BORDER_COLOR}; color:{TEXT_MUTED}; }}"            f"QPushButton:hover:!checked {{ border-color:{ACCENT}; color:{ACCENT}; }}")
+        self.nav_sum_btn.clicked.connect(self._on_nav_sum_toggled)
+        self.save_image_btn = QPushButton("📷  Save Image")
+        self.save_image_btn.setEnabled(False)
+        self.save_image_btn.setToolTip("Save the currently displayed reconstructed image as PNG")
+        self.save_image_btn.clicked.connect(self._save_recon_image)
+        img_btn_row.addWidget(self.nav_sum_btn)
+        img_btn_row.addWidget(self.save_image_btn)
+        recon_layout.addLayout(img_btn_row)
 
         # Level sliders
         slider_grid = QGridLayout()
@@ -4131,6 +4197,8 @@ class AnalysisTab(QWidget):
         if all_npz:
             self.run_btn.setEnabled(False)
             self.nav_bar.setVisible(False)
+            self.nav_sum_btn.setChecked(False)
+            self.nav_sum_btn.setEnabled(False)
             self._nav_paths  = list(self._queue)
             self._nav_idx    = 0
             self._nav_memory = {}
@@ -4153,6 +4221,7 @@ class AnalysisTab(QWidget):
             if n > 1:
                 self._update_nav_bar()
                 self.nav_bar.setVisible(True)
+                self.nav_sum_btn.setEnabled(True)
                 self._log("Use ◀ ▶ to navigate.")
             # Show first file's result (already in memory from last completed)
             first = self._nav_paths[0]
@@ -4228,6 +4297,10 @@ class AnalysisTab(QWidget):
         self.primary_radio.setEnabled(False)
         self.companion_radio.setEnabled(False)
         self.clear_btn.setEnabled(False)
+        self.cursor_radius_spin.setEnabled(False)
+        self.bg_sample_btn.setEnabled(False)
+        self.bg_subtract_chk.setEnabled(False)
+        self._clear_cursor_circle()
         self._clear_all(silent=True)
         for card in (self.card_theta, self.card_rho,
                      self.card_theta_sky, self.card_rho_sky):
@@ -4346,24 +4419,26 @@ class AnalysisTab(QWidget):
         self.primary_radio.setEnabled(True)
         self.companion_radio.setEnabled(True)
         self.clear_btn.setEnabled(True)
+        self.cursor_radius_spin.setEnabled(True)
+        self.bg_sample_btn.setEnabled(True)
+        # Reset background on new image
+        self._bg_level = None
+        self.bg_subtract_chk.setChecked(False)
+        self.bg_subtract_chk.setEnabled(False)
         self._set_click_mode('primary')
 
         n   = result['n_frames']
         roi = result['roi_size']
         n_str = str(n) if n > 0 else "n/a"
 
-        _rc = result['recon'].T
-        _rc_min, _rc_max = _rc.min(), _rc.max()
-        if _rc_max > _rc_min:
-            _rc = (_rc - _rc_min) / (_rc_max - _rc_min) * 255.0
         self.level_min_slider.setValue(0)
         self.level_max_slider.setValue(255)
-        self.recon_view.setImage(
-            _rc, autoLevels=False, autoRange=True, levels=(0, 255))
+        self._apply_recon_display(auto_range=True)
 
         deconv  = result.get('deconv_done', False)
         ref_arr = result.get('ref_bispec')
         self.save_bispec_btn.setEnabled(True)
+        self.save_image_btn.setEnabled(True)
 
         if deconv:
             self._log(
@@ -4412,6 +4487,8 @@ class AnalysisTab(QWidget):
         }
 
     def _nav_go(self, idx: int):
+        self._clear_cursor_circle()
+        self.nav_sum_btn.setChecked(False)
         self._nav_save_current()
         self._nav_idx = idx
         self._update_nav_bar()
@@ -4462,8 +4539,99 @@ class AnalysisTab(QWidget):
         if self._nav_idx < len(self._nav_paths) - 1:
             self._nav_go(self._nav_idx + 1)
 
+    # ── Cursor circle & background subtraction ────────────────────────────
+
+    def _on_cursor_radius_changed(self, _=None):
+        """Redraw the cursor circle whenever radius changes."""
+        # Will redraw on next mouse move; force a redraw if we have a position
+        if hasattr(self, '_cursor_last_pos') and self._cursor_last_pos:
+            self._draw_cursor_circle(*self._cursor_last_pos)
+
+    def _draw_cursor_circle(self, x: float, y: float):
+        """Draw/update the aperture circle at (x,y) in data coordinates."""
+        self._clear_cursor_circle()
+        if self._result is None:
+            return
+        self._cursor_last_pos = (x, y)
+        r = self.cursor_radius_spin.value()
+        theta = np.linspace(0, 2 * np.pi, 64)
+        color = WARNING   # neutral yellow — not tied to primary/companion colour
+        self._cursor_circle_item = pg.PlotCurveItem(
+            x + r * np.cos(theta),
+            y + r * np.sin(theta),
+            pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DashLine))
+        self.recon_view.getView().addItem(self._cursor_circle_item)
+
+    def _clear_cursor_circle(self):
+        if self._cursor_circle_item is not None:
+            try:
+                self.recon_view.getView().removeItem(self._cursor_circle_item)
+            except Exception:
+                pass
+            self._cursor_circle_item = None
+
+    def _on_recon_hover(self, x: float, y: float):
+        """Redraw cursor circle as mouse moves."""
+        if self._result is None:
+            return
+        self._draw_cursor_circle(x, y)
+
+    def _on_bg_sample_clicked(self, checked: bool):
+        if not checked:
+            return
+        self._log("Click on a signal-free region to sample background.")
+
+    def _sample_background(self, x: float, y: float):
+        """Average pixel values inside the cursor circle and store as BG level."""
+        img = self._result.get('recon') if self._result else None
+        if img is None:
+            return
+        r = self.cursor_radius_spin.value()
+        img_t = img.T
+        W, H  = img_t.shape
+        ix = int(round(x)); iy = int(round(y))
+        x0 = max(0, ix - r); x1 = min(W, ix + r + 1)
+        y0 = max(0, iy - r); y1 = min(H, iy + r + 1)
+        patch = img_t[x0:x1, y0:y1].astype(np.float64)
+        xx, yy = np.mgrid[x0:x1, y0:y1]
+        mask = (xx - x)**2 + (yy - y)**2 <= r**2
+        vals = patch[mask]
+        if vals.size == 0:
+            return
+        self._bg_level = float(vals.mean())
+        self._log(f"Background sampled: {self._bg_level:.4f}  (mean over {vals.size} px)")
+        self.bg_subtract_chk.setEnabled(True)
+        self.bg_sample_btn.setChecked(False)
+        # Auto-enable subtract
+        self.bg_subtract_chk.setChecked(True)
+
+    def _on_bg_subtract_toggled(self, checked: bool):
+        """Re-display the image with or without background subtraction."""
+        if self._result is None:
+            return
+        self._apply_recon_display()
+
+    def _apply_recon_display(self, auto_range: bool = False):
+        """Refresh the image display applying current BG subtract state."""
+        img = self._result.get('recon') if self._result else None
+        if img is None:
+            return
+        arr = img.T.astype(np.float32)
+        if self.bg_subtract_chk.isChecked() and self._bg_level is not None:
+            arr = np.clip(arr - self._bg_level, 0, None)
+        arr_min, arr_max = arr.min(), arr.max()
+        if arr_max > arr_min:
+            arr = (arr - arr_min) / (arr_max - arr_min) * 255.0
+        self.recon_view.setImage(arr, autoLevels=False, autoRange=auto_range,
+                                 levels=(self.level_min_slider.value(),
+                                         self.level_max_slider.value()))
+
     def _on_recon_click(self, x: float, y: float):
         if self._result is None:
+            return
+        # Background sampling mode
+        if self.bg_sample_btn.isChecked():
+            self._sample_background(x, y)
             return
         if self._click_mode == 'primary':
             self._place_primary(x, y)
@@ -4641,6 +4809,139 @@ class AnalysisTab(QWidget):
             self._log("Markers cleared.")
 
     # ── Save bispectrum ────────────────────────────────────────────────────
+
+    # ── Sum all NPZ / save image ───────────────────────────────────────────
+
+    def _on_nav_sum_toggled(self, checked: bool):
+        """Combine all reconstructed bispectra and display the sum image."""
+        if not checked:
+            # Restore the currently selected individual file
+            path = self._nav_paths[self._nav_idx]
+            mem  = self._nav_memory.get(path)
+            if mem and mem.get('result'):
+                self._on_finished(mem['result'])
+                if mem.get('primary_pos'):
+                    self._place_primary(*mem['primary_pos'])
+                if mem.get('companion_pos'):
+                    self._place_companion(*mem['companion_pos'])
+                if mem.get('primary_pos') and mem.get('companion_pos'):
+                    self._update_measurement()
+            return
+
+        # Collect avg_power and avg_bispec from all completed entries
+        powers, bispectra = [], []
+        for p in self._nav_paths:
+            mem = self._nav_memory.get(p)
+            if mem and mem.get('result'):
+                r = mem['result']
+                if r.get('avg_power') is not None and r.get('avg_bispec') is not None:
+                    powers.append(r['avg_power'])
+                    bispectra.append(r['avg_bispec'])
+
+        if len(powers) < 2:
+            self._log("⚠ Need at least 2 reconstructed files for sum view.", error=True)
+            self.nav_sum_btn.setChecked(False)
+            return
+
+        self._log(f"Σ Summing {len(powers)} bispectra…")
+        combined_power  = np.sum(powers,    axis=0)
+        combined_bispec = np.sum(bispectra, axis=0)
+
+        # Re-run reconstruction on the combined arrays
+        # offsets are geometry-only (depend on k_max and ROI size, not data)
+        # so we can reuse them from any of the collected results
+        offsets = next(
+            mem['result']['offsets']
+            for p in self._nav_paths
+            if (mem := self._nav_memory.get(p)) and mem.get('result') and 'offsets' in mem['result']
+        )
+        recon, *_ = iterative_reconstruct(
+            combined_power, combined_bispec, offsets,
+            k_max  = self.kmax_spin.value(),
+            n_iter = self.niter_spin.value(),
+        )
+        autocorr = compute_autocorrelogram(combined_power)
+
+        # Build a synthetic result dict so _on_finished can display it
+        sum_result = {
+            'recon':             recon,
+            'avg_power':         combined_power,
+            'avg_bispec':        combined_bispec,
+            'autocorr':          autocorr,
+            'n_frames':          0,
+            'roi_size':          powers[0].shape[0],
+            'mean_bispec_mag':   float(np.abs(combined_bispec).mean()),
+            'mean_abs_phase':    0.0,
+            'nonzero_phase_pct': 0.0,
+            'deconv_done':       False,
+            'ref_bispec':        None,
+        }
+        self._on_finished(sum_result)
+        self._log(f"Σ Sum of {len(powers)} files displayed.")
+
+    def _save_recon_image(self):
+        """Save the currently displayed reconstructed image as a PNG file."""
+        if self._result is None:
+            self._log("⚠ No image to save.", error=True)
+            return
+        img = self._result.get('recon')
+        if img is None:
+            self._log("⚠ No reconstructed image available.", error=True)
+            return
+        if self._nav_paths and self.nav_sum_btn.isChecked():
+            default = "sum_result.png"
+        elif self._nav_paths:
+            # Use the currently displayed file from the navigator
+            stem = Path(self._nav_paths[self._nav_idx]).stem
+            default = f"{stem}.png"
+        else:
+            src = self.file_edit.text()
+            stem = Path(src).stem if src else "recon"
+            default = f"{stem}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Reconstructed Image",
+            str(Path(_working_dir()) / default),
+            "PNG images (*.png);;TIFF images (*.tif *.tiff);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import LinearSegmentedColormap
+
+            # Apply current display levels
+            lo = self.level_min_slider.value()
+            hi = self.level_max_slider.value()
+            arr = img.T.astype(np.float32)   # match displayed orientation
+            arr_min, arr_max = arr.min(), arr.max()
+            if arr_max > arr_min:
+                arr = (arr - arr_min) / (arr_max - arr_min) * 255.0
+            arr = np.clip((arr - lo) / max(hi - lo, 1) * 255.0, 0, 255)
+
+            # Build a matplotlib colormap from the active pyqtgraph colormap
+            # by sampling its LUT — works for all custom colormaps
+            cmap_name = self.recon_cmap_combo.currentText()
+            pg_cm = _get_colormaps().get(cmap_name)
+            if pg_cm is not None:
+                lut = pg_cm.getLookupTable(nPts=256, alpha=False)   # (256, 3) uint8
+                mpl_colors = lut / 255.0
+                mpl_cmap = LinearSegmentedColormap.from_list(
+                    cmap_name, mpl_colors, N=256)
+            else:
+                mpl_cmap = 'gray'
+
+            fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+            ax.imshow(arr, cmap=mpl_cmap, origin='upper',
+                      vmin=0, vmax=255, interpolation='nearest')
+            ax.axis('off')
+            fig.tight_layout(pad=0)
+            fig.savefig(path, bbox_inches='tight', pad_inches=0)
+            plt.close(fig)
+            self._log(f"✓ Image saved: {Path(path).name}")
+        except Exception as e:
+            self._log(f"⚠ Save failed: {e}", error=True)
 
     def _save_bispec(self):
         if self._result is None or self._result.get('avg_bispec') is None:
@@ -5124,10 +5425,12 @@ class SpeckleMainWindow(QMainWindow):
         self.drift_tab      = DriftTab()
         self.preprocess_tab = PreprocessTab()
         self.analysis_tab   = AnalysisTab()
+        self.history_tab    = HistoryTab()
 
         self.tabs.addTab(self.drift_tab,      "🧭  Drift Alignment")
         self.tabs.addTab(self.preprocess_tab, "⚙  Preprocess")
         self.tabs.addTab(self.analysis_tab,   "🔭  Analysis")
+        self.tabs.addTab(self.history_tab,    "📜  History")
 
         self.setCentralWidget(self.tabs)
 
@@ -5189,6 +5492,1190 @@ class SpeckleMainWindow(QMainWindow):
         self.drift_tab.refresh_styles()
         self.preprocess_tab.refresh_styles()
         self.analysis_tab.refresh_styles()
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ── HISTORY TAB ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+CATALOG_DIR = Path.home() / ".speckle_suite" / "catalogs"
+CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+
+ORB6_EPHEM_URL    = "https://crf.usno.navy.mil/data_products/WDS/orb6/orb6ephem.txt"
+ORB6_ORBITS_URL   = "https://crf.usno.navy.mil/data_products/WDS/orb6/orb6orbits.txt"
+INT4_URL          = "https://crf.usno.navy.mil/data_products/WDS/int4/int4_all.txt"
+
+ORB6_EPHEM_FILE   = CATALOG_DIR / "orb6ephem.txt"
+ORB6_ORBITS_FILE  = CATALOG_DIR / "orb6orbits.txt"
+INT4_FILE         = CATALOG_DIR / "int4_all.txt"
+INT4_DB_FILE      = CATALOG_DIR / "int4.sqlite"
+
+# Technique code → display label and colour
+INT4_TECHNIQUES = {
+    "S": ("Speckle",       "#58a6ff"),
+    "Su": ("Speckle",      "#58a6ff"),
+    "Sc": ("Speckle CCD",  "#3fb950"),
+    "A":  ("Adaptive opt", "#d2a679"),
+    "H":  ("Hipparcos",    "#d29922"),
+    "Hh": ("Hipparcos",    "#d29922"),
+    "Hf": ("Hipparcos",    "#d29922"),
+    "Ht": ("Hipparcos",    "#d29922"),
+    "Hw": ("Hipparcos",    "#d29922"),
+    "M":  ("Micrometry",   "#8b949e"),
+    "C":  ("CCD",          "#a5d6ff"),
+    "E":  ("Eyepiece int", "#c9d1d9"),
+    "E2": ("Eyepiece int", "#c9d1d9"),
+}
+
+def _int4_color(tech: str) -> str:
+    for k, (_, c) in INT4_TECHNIQUES.items():
+        if tech.strip().startswith(k):
+            return c
+    return "#8b949e"
+
+def _int4_label(tech: str) -> str:
+    for k, (l, _) in INT4_TECHNIQUES.items():
+        if tech.strip().startswith(k):
+            return l
+    return "Other"
+
+
+def derive_wds_key(ra_deg: float, dec_deg: float) -> str:
+    """Derive the WDS designation string (HHMM±DDMM) from J2000 coords."""
+    ra_h = ra_deg / 15.0
+    h    = int(ra_h)
+    m    = (ra_h - h) * 60.0
+    hh   = f"{h:02d}"
+    mm   = f"{m:04.1f}".replace(".", "")[:4]   # e.g. 12.3 → "123" → pad
+    sign = "+" if dec_deg >= 0 else "-"
+    ad   = abs(dec_deg)
+    dd   = int(ad)
+    dm   = int((ad - dd) * 60.0)
+    return f"{hh}{mm}{sign}{dd:02d}{dm:02d}"
+
+
+def _download_catalog(url: str, dest: Path, log_cb=None) -> bool:
+    """Download a catalog file with basic progress logging."""
+    import urllib.request
+    try:
+        if log_cb:
+            log_cb(f"Downloading {dest.name}…")
+        urllib.request.urlretrieve(url, dest)
+        if log_cb:
+            log_cb(f"✓ {dest.name} ({dest.stat().st_size // 1024} KB)")
+        return True
+    except Exception as e:
+        if log_cb:
+            log_cb(f"⚠ Download failed: {e}")
+        return False
+
+
+def _build_int4_db(log_cb=None) -> bool:
+    """Parse INT4 flat file and build a SQLite index keyed by WDS key.
+
+    The file exists in two formats:
+    - HTML version: header lines start with '[' followed by precise coords
+    - Plain text version: header lines start directly with precise coords
+                          (format: HHMMSS.ss[+-]DDMMSS.s ...)
+    Both end the header line with the 5+4 WDS key (e.g. 05338+0337).
+    Data lines start with a decimal year (e.g. 1991.25).
+    """
+    import sqlite3, re
+    if log_cb:
+        log_cb("Building INT4 index (first-time, may take ~30 s)…")
+    con = sqlite3.connect(INT4_DB_FILE)
+    cur = con.cursor()
+    cur.execute("DROP TABLE IF EXISTS measures")
+    cur.execute("""CREATE TABLE measures (
+        wds_key TEXT, epoch REAL, theta REAL, sigma_theta REAL,
+        rho REAL, sigma_rho REAL, technique TEXT, reference TEXT)""")
+    cur.execute("CREATE INDEX idx_wds ON measures(wds_key)")
+
+    # Header pattern: precise J2000 coords HHMMSS.ss[+-]DDMMSS.s
+    coord_re = re.compile(r"^\[?\d{6}\.\d{2}[+-]\d{6}\.\d")
+    wds_re   = re.compile(r"(\d{5}[+-]\d{4})")
+
+    current_wds = None
+    batch = []
+
+    def _f(s):
+        s = s.strip(":q<>")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    with open(INT4_FILE, "r", errors="replace") as f:
+        for line in f:
+            # ── Header line detection ──────────────────────────────────────
+            if coord_re.match(line):
+                m = wds_re.search(line)
+                if m:
+                    current_wds = m.group(1)
+                continue
+
+            if current_wds is None:
+                continue
+
+            # ── Data line: must start with a plausible year ────────────────
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                epoch = float(parts[0].strip(":q"))
+            except ValueError:
+                continue
+            if not (1700 < epoch < 2200):
+                continue
+
+            try:
+                theta     = _f(parts[1]) if len(parts) > 1 else None
+                sig_theta = _f(parts[2]) if len(parts) > 2 else None
+                rho       = _f(parts[3]) if len(parts) > 3 else None
+                sig_rho   = _f(parts[4]) if len(parts) > 4 else None
+                technique = parts[-1]    if len(parts) > 1 else ""
+                reference = parts[-2]    if len(parts) > 2 else ""
+            except Exception:
+                continue
+
+            if theta is None and rho is None:
+                continue
+
+            batch.append((current_wds, epoch, theta, sig_theta,
+                          rho, sig_rho, technique, reference))
+            if len(batch) >= 5000:
+                cur.executemany("INSERT INTO measures VALUES(?,?,?,?,?,?,?,?)", batch)
+                batch.clear()
+
+    if batch:
+        cur.executemany("INSERT INTO measures VALUES(?,?,?,?,?,?,?,?)", batch)
+    con.commit()
+    con.close()
+    if log_cb:
+        log_cb(f"✓ INT4 index built: {INT4_DB_FILE.name}")
+    return True
+
+
+def query_int4(wds_key: str) -> list:
+    """Return list of dicts for all INT4 measures of a WDS key."""
+    import sqlite3
+    if not INT4_DB_FILE.exists():
+        return []
+    con = sqlite3.connect(INT4_DB_FILE)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT epoch,theta,sigma_theta,rho,sigma_rho,technique,reference "
+        "FROM measures WHERE wds_key=? ORDER BY epoch",
+        (wds_key,))
+    rows = cur.fetchall()
+    con.close()
+    return [{"epoch": r[0], "theta": r[1], "sigma_theta": r[2],
+             "rho": r[3], "sigma_rho": r[4],
+             "technique": r[5], "reference": r[6]} for r in rows]
+
+
+def query_orb6_ephem(wds_key: str) -> list:
+    """Return list of (year, theta, rho) from the ephemeris file.
+    
+    The format is: WDS  Discoverer  Grade  Ref  theta25 rho25 theta26 rho26 ...
+    Discoverer is sometimes two tokens (e.g. STT 159AB) so we detect the
+    data start by finding the first float-parseable token pair.
+    """
+    if not ORB6_EPHEM_FILE.exists():
+        return []
+    results = []
+    with open(ORB6_EPHEM_FILE, "r", errors="replace") as f:
+        for line in f:
+            if not line.startswith(wds_key):
+                continue
+            parts = line.split()
+            # Find where theta/rho data starts: first index i>=2 where
+            # parts[i] and parts[i+1] are both floats and parts[i] looks
+            # like a grade (1-9) or reference code precedes them.
+            # Simpler: scan from index 2 onward for the first numeric pair.
+            data_start = None
+            for i in range(2, len(parts) - 1):
+                try:
+                    float(parts[i]); float(parts[i+1])
+                    # Make sure we skip grade (single digit) and ref code
+                    # by requiring the value to be plausibly a theta (0-360)
+                    if 0.0 <= float(parts[i]) <= 360.0 and float(parts[i+1]) >= 0.0:
+                        # Check that the previous token looks like a reference code
+                        # (alphanumeric, not a float) to avoid false starts
+                        prev = parts[i-1]
+                        try:
+                            float(prev)
+                            # prev is also float — keep scanning
+                            continue
+                        except ValueError:
+                            data_start = i
+                            break
+                except (ValueError, IndexError):
+                    continue
+            if data_start is None:
+                continue
+            year = 2025.0
+            for i in range(data_start, len(parts) - 1, 2):
+                try:
+                    th = float(parts[i])
+                    rh = float(parts[i + 1])
+                    results.append((year, th, rh))
+                    year += 1.0
+                except ValueError:
+                    break
+    return results
+
+
+def query_orb6_elements(wds_key: str) -> dict | None:
+    """
+    Parse ORB6 orbital elements (fixed-width, single-line-per-entry format).
+
+    Format after WDS key:
+      ... catalog_ids  mag1  mag2  P  <unit>  [err]  a  <unit>  [err]
+          omega  [err]  Omega  [err]  T  <unit>  [err]  e  [err]  i  [err]
+          equinox  grade  [n]  ref  filename
+
+    Units appear as SEPARATE tokens after the value.
+    Dots (.) are uncertainty placeholders — skip them.
+    Everything before the first period-unit token is header (ids, magnitudes).
+    After P and a, elements appear in fixed order: omega, Omega, T, e, i.
+    """
+    if not ORB6_ORBITS_FILE.exists():
+        return None
+
+    period_units = {"c": 100.0, "d": 1/365.25, "h": 1/8766.0,
+                    "m": 1/525960.0, "y": 1.0}
+    axis_units   = {"a": 1.0, "m": 1e-3, "u": 1e-6}
+    all_units    = {*period_units, *axis_units}
+
+    def to_f(s):
+        try: return float(s.strip("*?:"))
+        except: return None
+
+    def jd_to_yr(jd):
+        return 2000.0 + (jd - 2451545.0) / 365.25
+
+    with open(ORB6_ORBITS_FILE, "r", errors="replace") as f:
+        for line in f:
+            if wds_key not in line[:35]:
+                continue
+            idx = line.index(wds_key)
+            before = line[idx-1] if idx > 0 else " "
+            after  = line[idx+len(wds_key)] if idx+len(wds_key) < len(line) else " "
+            if not (before.isspace() and after.isspace()):
+                continue
+
+            # Tokenise from WDS key onward; skip dots (uncertainty placeholders)
+            key_pos = line.index(wds_key)
+            raw_toks = [t for t in line[key_pos:].split() if t != "."]
+
+            # Build (value, unit) pairs — unit is next token if it is a known suffix
+            pairs = []
+            grade = None
+            j = 0
+            while j < len(raw_toks):
+                val = to_f(raw_toks[j])
+                if val is not None:
+                    nxt = raw_toks[j+1] if j+1 < len(raw_toks) else ""
+                    if nxt in all_units:
+                        pairs.append((val, nxt))
+                        j += 2
+                    else:
+                        pairs.append((val, ""))
+                        j += 1
+                else:
+                    # Try grade (standalone int 1-9)
+                    try:
+                        g = int(raw_toks[j])
+                        if 1 <= g <= 9:
+                            grade = g
+                    except ValueError:
+                        pass
+                    j += 1
+
+            # Assign in order: skip header until P, then a, omega, Omega, T, e, i
+            P_yr = a_as = omega_deg = Omega_deg = T_yr = e_val = i_deg = None
+            past_P = False
+            elem_idx = 0  # position after P+a
+
+            for val, unit in pairs:
+                # ── Before P: ignore everything ────────────────────────────
+                if not past_P:
+                    if unit in period_units and val > 0:
+                        P_yr = val * period_units[unit]
+                        past_P = True
+                    continue
+
+                # ── Semi-major axis (first token after P) ──────────────────
+                if a_as is None:
+                    a_as = val * axis_units.get(unit, 1.0)
+                    continue
+
+                # ── Remaining elements in fixed order ──────────────────────
+                # i, Omega, T, e, omega  (ORB6 format order)
+                if i_deg is None:
+                    i_deg = val
+                elif Omega_deg is None:
+                    Omega_deg = val
+                elif T_yr is None:
+                    if unit in period_units:
+                        T_yr = val  # already a year value with 'y' suffix
+                    elif val > 2400000:
+                        T_yr = jd_to_yr(val)       # full JD
+                    elif val > 10000:
+                        T_yr = jd_to_yr(val + 2400000)  # truncated JD
+                    else:
+                        T_yr = val  # bare year
+                elif e_val is None and 0 <= val < 1.0:
+                    e_val = val
+                elif omega_deg is None and 0 <= val < 360:
+                    omega_deg = val
+
+            if P_yr is None or a_as is None:
+                continue
+
+            return {
+                "P":         P_yr,
+                "a":         a_as,
+                "i":         i_deg     or 0.0,
+                "Omega":     Omega_deg or 0.0,
+                "T":         T_yr      or 2000.0,
+                "e":         e_val     or 0.0,
+                "omega":     omega_deg or 0.0,
+                "grade":     grade,
+                "_raw_line": line.strip(),
+            }
+    return None
+
+
+def _solve_kepler(M: np.ndarray, e: float, tol: float = 1e-10) -> np.ndarray:
+    """Solve Kepler's equation M = E - e*sin(E) for E (vectorised)."""
+    E = M.copy()
+    for _ in range(50):
+        dE = (M - E + e * np.sin(E)) / (1.0 - e * np.cos(E))
+        E += dE
+        if np.max(np.abs(dE)) < tol:
+            break
+    return E
+
+
+def compute_orbit_curve(ephem_pts: list, orb_elem: dict | None = None,
+                        n_pts: int = 360) -> tuple:
+    """
+    Compute the full orbital ellipse from Keplerian elements via Thiele-Innes.
+
+    Samples uniformly in mean anomaly (0 -> 2pi) for even phase coverage.
+    Returns (theta_arr_deg, rho_arr_arcsec).
+
+    Note: the ORB6 ephemeris file may use a more recent orbit solution than
+    the elements stored in the plain-text file. If the curves do not match
+    the ephemeris predictions, this is expected — both are correct computations
+    from different published orbit solutions for the same star.
+    """
+    if orb_elem and orb_elem.get("P") and orb_elem.get("a"):
+        a     = orb_elem["a"]
+        e     = orb_elem.get("e",     0.0)
+        i     = np.radians(orb_elem.get("i",     0.0))
+        Omega = np.radians(orb_elem.get("Omega", 0.0))
+        T0    = orb_elem.get("T",   2000.0)
+        P     = orb_elem["P"]
+        omega = np.radians(orb_elem.get("omega", 0.0))
+
+        A =  a*(np.cos(omega)*np.cos(Omega) - np.sin(omega)*np.sin(Omega)*np.cos(i))
+        B =  a*(np.cos(omega)*np.sin(Omega) + np.sin(omega)*np.cos(Omega)*np.cos(i))
+        F =  a*(-np.sin(omega)*np.cos(Omega) - np.cos(omega)*np.sin(Omega)*np.cos(i))
+        G =  a*(-np.sin(omega)*np.sin(Omega) + np.cos(omega)*np.cos(Omega)*np.cos(i))
+
+        # Sample one full orbit uniformly in mean anomaly
+        # Heintz convention: X = cosE - e,  Y = sqrt(1-e^2)*sinE
+        # A,B,F,G already contain factor a; X,Y do NOT.
+        M_arr = np.linspace(0, 2*np.pi, n_pts, endpoint=False)
+        E_arr = _solve_kepler(M_arr, e)
+        X     = np.cos(E_arr) - e
+        Y     = np.sqrt(1 - e**2) * np.sin(E_arr)
+        dRA   = B*X + G*Y
+        dDec  = A*X + F*Y
+        return np.degrees(np.arctan2(dRA, dDec)) % 360, np.hypot(dRA, dDec)
+
+    # Fallback: interpolate ephemeris points
+    if len(ephem_pts) < 2:
+        return (np.array([p[1] for p in ephem_pts]),
+                np.array([p[2] for p in ephem_pts]))
+    from scipy.interpolate import interp1d
+    years  = np.array([p[0] for p in ephem_pts])
+    thetas = np.unwrap(np.radians([p[1] for p in ephem_pts]))
+    rhos   = np.array([p[2] for p in ephem_pts])
+    t_int  = np.linspace(years[0], years[-1], n_pts)
+    return (np.degrees(interp1d(years, thetas,
+                                fill_value="extrapolate")(t_int)) % 360,
+            interp1d(years, rhos, fill_value="extrapolate")(t_int))
+
+
+def search_wds_by_discoverer(discoverer: str) -> str | None:
+    """
+    Search ORB6 ephemeris and INT4 files for a discoverer designation
+    (e.g. "STT 159", "HU 628", "STT159AB") and return the WDS key if found.
+
+    Key insight: the ephemeris file stores discoverers as two tokens when
+    there is a space between prefix and number (e.g. "STT 159AB"), so we
+    must join parts[1]+parts[2] before comparing.
+    """
+    import re
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", s.upper())
+
+    def _strip_suffix(s: str) -> str:
+        """Strip trailing component letters: AB, Aa,Ab, BC, A, B etc."""
+        return re.sub(r"[,]?(AA|AB|AC|AD|BC|CD|Aa|Ab|Ac|[A-Z]{1,2})$", "", s)
+
+    raw_base = _strip_suffix(_norm(discoverer))
+    if not raw_base:
+        return None
+
+    wds_re = re.compile(r"(\d{5}[+-]\d{4})")
+
+    # ── 1. ORB6 ephemeris ────────────────────────────────────────────────────
+    if ORB6_EPHEM_FILE.exists():
+        with open(ORB6_EPHEM_FILE, "r", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                # Discoverer may be one token ("STT159AB") or two ("STT 159AB")
+                # Join parts[1]+parts[2] to handle both cases
+                disc = _norm(parts[1] + (parts[2] if len(parts) > 2 else ""))
+                disc_base = _strip_suffix(disc)
+                if disc_base == raw_base or disc == raw_base:
+                    m = wds_re.match(parts[0])
+                    if m:
+                        return m.group(1)
+
+    # ── 2. ORB6 orbital elements ─────────────────────────────────────────────
+    if ORB6_ORBITS_FILE.exists():
+        with open(ORB6_ORBITS_FILE, "r", errors="replace") as f:
+            for line in f:
+                # Only check lines that contain a WDS key (start with coords)
+                m_wds = wds_re.match(line.strip())
+                if not m_wds:
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                disc = _norm(parts[1] + (parts[2] if len(parts) > 2 else ""))
+                disc_base = _strip_suffix(disc)
+                if disc_base == raw_base or disc == raw_base:
+                    return m_wds.group(1)
+
+    # ── 3. INT4 raw file header lines ────────────────────────────────────────
+    if INT4_FILE.exists():
+        with open(INT4_FILE, "r", errors="replace") as f:
+            for line in f:
+                if not line.startswith("["):
+                    continue
+                # Header format: [coords  ADS_name  DISC_CODE  ...  WDS_key
+                # Fastest check: is the raw_base anywhere in the normalised line?
+                if raw_base not in _norm(line):
+                    continue
+                m = wds_re.search(line)
+                if m:
+                    return m.group(1)
+
+    return None
+
+
+class CatalogWorker(QThread):
+    """Background worker for downloads and INT4 DB build."""
+    status  = pyqtSignal(str)
+    finished = pyqtSignal(bool)
+
+    def __init__(self, action: str):
+        super().__init__()
+        self.action = action  # "download_all" | "build_db"
+
+    def run(self):
+        try:
+            if self.action == "download_all":
+                ok = True
+                for url, dest in [
+                    (ORB6_EPHEM_URL,  ORB6_EPHEM_FILE),
+                    (ORB6_ORBITS_URL, ORB6_ORBITS_FILE),
+                    (INT4_URL,        INT4_FILE),
+                ]:
+                    ok = ok and _download_catalog(url, dest, self.status.emit)
+                if ok and INT4_FILE.exists():
+                    self.status.emit("Building INT4 index…")
+                    _build_int4_db(self.status.emit)
+                self.finished.emit(ok)
+            elif self.action == "build_db":
+                ok = _build_int4_db(self.status.emit)
+                self.finished.emit(ok)
+        except Exception as e:
+            self.status.emit(f"⚠ {e}")
+            self.finished.emit(False)
+
+
+class HistoryTab(QWidget):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._wds_key:    str | None = None
+        self._int4_data:  list = []
+        self._ephem_pts:  list = []
+        self._orb_elem:   dict | None = None
+        self._user_meas:  list = []   # list of loaded JSON dicts
+        self._worker:     object = None
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        # ── Left panel ────────────────────────────────────────────────────
+        left = QWidget(); left.setFixedWidth(260)
+        lv = QVBoxLayout(left); lv.setSpacing(8); lv.setContentsMargins(0,0,0,0)
+
+        # Star name lookup
+        name_group = QGroupBox("Star Lookup")
+        ng = QVBoxLayout(name_group); ng.setSpacing(6)
+        name_row = QHBoxLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g. gamma Vir, WDS 12417-0127")
+        self.name_edit.returnPressed.connect(self._resolve_star)
+        self.resolve_btn = QPushButton("Resolve")
+        self.resolve_btn.setFixedWidth(70)
+        self.resolve_btn.clicked.connect(self._resolve_star)
+        name_row.addWidget(self.name_edit)
+        name_row.addWidget(self.resolve_btn)
+        ng.addLayout(name_row)
+        self.wds_lbl = QLabel("WDS: —")
+        self.wds_lbl.setStyleSheet(f"font-size:10px; color:{TEXT_MUTED};")
+        self.coord_lbl = QLabel("Coords: —")
+        self.coord_lbl.setStyleSheet(f"font-size:10px; color:{TEXT_MUTED};")
+        self.info_lbl = QLabel("")
+        self.info_lbl.setStyleSheet(f"font-size:10px; color:{TEXT_MUTED};")
+        self.info_lbl.setWordWrap(True)
+        ng.addWidget(self.wds_lbl)
+        ng.addWidget(self.coord_lbl)
+        ng.addWidget(self.info_lbl)
+        lv.addWidget(name_group)
+
+        # Your measurements
+        meas_group = QGroupBox("Your Measurements")
+        mg = QVBoxLayout(meas_group); mg.setSpacing(6)
+        self.load_json_btn = QPushButton("Load Result JSON(s)…")
+        self.load_json_btn.clicked.connect(self._load_json)
+        self.meas_list = QTextEdit()
+        self.meas_list.setReadOnly(True)
+        self.meas_list.setMaximumHeight(90)
+        self.meas_list.setStyleSheet(f"font-size:9px; color:{TEXT_MUTED};")
+        self.clear_meas_btn = QPushButton("Clear")
+        self.clear_meas_btn.setFixedWidth(55)
+        self.clear_meas_btn.clicked.connect(self._clear_meas)
+        mb_row = QHBoxLayout()
+        mb_row.addWidget(self.load_json_btn)
+        mb_row.addWidget(self.clear_meas_btn)
+        mg.addLayout(mb_row)
+        mg.addWidget(self.meas_list)
+        lv.addWidget(meas_group)
+
+        # Catalog status + download
+        cat_group = QGroupBox("Catalogs")
+        cg = QVBoxLayout(cat_group); cg.setSpacing(6)
+        self.cat_status_lbl = QLabel("")
+        self.cat_status_lbl.setStyleSheet(f"font-size:9px; color:{TEXT_MUTED};")
+        self.cat_status_lbl.setWordWrap(True)
+        self.download_btn = QPushButton("⬇  Download / Update Catalogs")
+        self.download_btn.clicked.connect(self._download_catalogs)
+        self.rebuild_db_btn = QPushButton("🔄  Rebuild INT4 Index")
+        self.rebuild_db_btn.setToolTip("Re-parse the INT4 file and rebuild the local search index")
+        self.rebuild_db_btn.clicked.connect(self._rebuild_int4_db)
+        cg.addWidget(self.cat_status_lbl)
+        cg.addWidget(self.download_btn)
+        cg.addWidget(self.rebuild_db_btn)
+        lv.addWidget(cat_group)
+        self._refresh_cat_status()
+
+        # Display mode toggle
+        mode_row = QHBoxLayout(); mode_row.setSpacing(4)
+        self.polar_btn = QPushButton("Polar")
+        self.polar_btn.setCheckable(True); self.polar_btn.setChecked(True)
+        self.polar_btn.setFixedHeight(26)
+        self.cartesian_btn = QPushButton("Cartesian")
+        self.cartesian_btn.setCheckable(True)
+        self.cartesian_btn.setFixedHeight(26)
+        self._plot_mode_grp = QButtonGroup()
+        self._plot_mode_grp.addButton(self.polar_btn)
+        self._plot_mode_grp.addButton(self.cartesian_btn)
+        self._plot_mode_grp.setExclusive(True)
+        self.polar_btn.clicked.connect(lambda: self._result_available() and self._plot())
+        self.cartesian_btn.clicked.connect(lambda: self._result_available() and self._plot())
+        mode_row.addWidget(self.polar_btn); mode_row.addWidget(self.cartesian_btn)
+        lv.addLayout(mode_row)
+
+        # Plot button
+        self.plot_btn = QPushButton("🔭  Plot History")
+        self.plot_btn.setStyleSheet(_primary_btn_style())
+        self.plot_btn.setEnabled(False)
+        self.plot_btn.clicked.connect(self._plot)
+        lv.addWidget(self.plot_btn)
+
+        lv.addStretch()
+
+        # Log
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setMaximumHeight(120)
+        lv.addWidget(self.log_edit)
+
+        root.addWidget(left)
+
+        # ── Right panel: matplotlib canvas ───────────────────────────────
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        import matplotlib.pyplot as plt
+        self._fig, self._ax = plt.subplots(
+            subplot_kw={"projection": "polar"},
+            figsize=(6, 6))
+        self._fig.patch.set_facecolor(DARK_BG)
+        self._ax.set_facecolor(PANEL_BG)
+        # Disclaimer label above the plot
+        right_panel = QWidget()
+        right_vbox  = QVBoxLayout(right_panel)
+        right_vbox.setContentsMargins(4, 4, 4, 4)
+        right_vbox.setSpacing(4)
+
+        disclaimer = QLabel(
+            "⚠️  This comparison tool between your measurements and historical data / orbit "            "must <b>not</b> be used to bias your determination of ρ and θ. "            "It is for curiosity only — and because it is fun! 🔭"
+        )
+        disclaimer.setWordWrap(True)
+        disclaimer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        disclaimer.setStyleSheet(
+            f"color:{TEXT_MUTED}; font-style:italic; font-size:10px; "            f"padding:4px 8px; border:1px solid {BORDER_COLOR}; "            f"border-radius:4px; background:{PANEL_BG};"
+        )
+        right_vbox.addWidget(disclaimer)
+
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setMinimumWidth(400)
+        right_vbox.addWidget(self._canvas, 1)
+        root.addWidget(right_panel, 1)
+
+    # ── Catalog status ─────────────────────────────────────────────────────
+
+    def _refresh_cat_status(self):
+        lines = []
+        for f, label in [
+            (ORB6_EPHEM_FILE,  "ORB6 ephemeris"),
+            (ORB6_ORBITS_FILE, "ORB6 elements"),
+            (INT4_FILE,        "INT4 catalog"),
+            (INT4_DB_FILE,     "INT4 index"),
+        ]:
+            if f.exists():
+                kb = f.stat().st_size // 1024
+                lines.append(f"✓ {label} ({kb} KB)")
+            else:
+                lines.append(f"✗ {label} missing")
+        self.cat_status_lbl.setText("\n".join(lines))
+
+    def _download_catalogs(self):
+        self.download_btn.setEnabled(False)
+        self._log("Starting catalog download…")
+        self._worker = CatalogWorker("download_all")
+        self._worker.status.connect(self._log)
+        self._worker.finished.connect(self._on_catalog_done)
+        self._worker.start()
+
+    def _on_catalog_done(self, ok: bool):
+        self.download_btn.setEnabled(True)
+        self._refresh_cat_status()
+        self._log("✓ Catalogs ready." if ok else "⚠ Some downloads failed.")
+
+    def _rebuild_int4_db(self):
+        if not INT4_FILE.exists():
+            self._log("⚠ INT4 file not downloaded yet.")
+            return
+        if INT4_DB_FILE.exists():
+            INT4_DB_FILE.unlink()
+        self.rebuild_db_btn.setEnabled(False)
+        self._log("Rebuilding INT4 index…")
+        self._worker = CatalogWorker("build_db")
+        self._worker.status.connect(self._log)
+        self._worker.finished.connect(lambda ok: (
+            self.rebuild_db_btn.setEnabled(True),
+            self._refresh_cat_status(),
+            self._log("✓ INT4 index rebuilt." if ok else "⚠ Rebuild failed.")
+        ))
+        self._worker.start()
+
+    # ── Star resolution ────────────────────────────────────────────────────
+
+    def _resolve_star(self):
+        """
+        Resolve the star name to a WDS key. Handles three formats:
+          1. WDS designation directly: "12417-0127" or "12417+0127"
+          2. Discoverer designation:   "STT 159AB", "HU628", "BU 1047"
+          3. Common name via Simbad:   "gamma Vir", "HD 110379"
+        """
+        import re
+        name = self.name_edit.text().strip()
+        if not name:
+            return
+        self._log(f"Resolving '{name}'…")
+
+        # ── Format 1: bare WDS key  HHMM[+/-]DDMM ───────────────────────
+        wds_direct = re.match(r'^(\d{4,5}[+-]\d{3,4})$', name.replace(' ', ''))
+        if wds_direct:
+            self._wds_key = wds_direct.group(1).zfill(9)  # normalise length
+            self._set_wds(self._wds_key, source="direct input")
+            return
+
+        # ── Format 2: discoverer designation (letters + digits) ──────────
+        # Matches patterns like STT159, HU 628, BU 1047AB, CHR 122Aa
+        disc_match = re.match(r'^([A-Za-z]{1,6})\s*(\d+)', name)
+        if disc_match:
+            # Only treat as discoverer if it doesn't look like a Greek letter name
+            # (greek letters are 2-3 chars like "gam", "alp" but Simbad handles those)
+            code = disc_match.group(1).upper()
+            # Known discoverer code prefixes (partial list of common ones)
+            DISCOVERER_PREFIXES = {
+                "STF","STT","STI","SHY","HU","HO","HJ","BU","BV","CHR",
+                "WSI","MSN","TOK","ZIR","MCA","BAG","LDS","ES","KUI",
+                "A","AG","B","D","H","I","J","S","T","WRH","GRB","COU",
+                "FIN","FLD","JOY","MLR","MLO","SEI","SEE","SLE","SME",
+                "COP","OST","BOE","CAR","GAL","HDS","TDS","GAA","RST",
+                "GNT","ARA","BLA","CHE","COM","COO","COV","CPO","CRB",
+                "DAM","DOC","E","ENG","F","FRV","G","GIC","GII","GKH",
+                "GYL","H","HAL","HDO","HHL","HIP","HLM","HMB","HRG",
+                "HRL","HRR","IDT","INN","INT","IOT","JAC","JCA","JNE",
+                "JNN","JON","KAP","KEN","KHR","KID","LAF","LDS","LEI",
+                "LEP","LFT","LIN","LTT","MAL","MBK","MCA","MCL","MED",
+                "MEL","MIL","MIT","MJO","MLR","MOL","MPR","MRC","MSR",
+                "MTL","MUG","MUI","MZN","NBD","NOR","NSS","NZO","OCA",
+                "OCT","OPP","ORL","OSO","OTT","PAU","PEK","PIK","PLQ",
+                "POP","PRE","PRV","QUI","RAB","RAO","RAT","RBS","RCA",
+                "RCR","REI","REN","RHD","RIZ","RKO","RLY","ROB","ROS",
+                "RPL","RSN","RUG","SAA","SAL","SCA","SCJ","SCO","SEG",
+                "SHJ","SHT","SIN","SIS","SKI","SKO","SKT","SLR","SML",
+                "SMN","SNC","SOD","SOZ","SRN","SST","STB","STE","STH",
+                "STR","STZ","SUB","SUL","SWB","SYN","TCH","TDT","TEL",
+                "TGT","THD","TJH","TKD","TND","TNT","TOR","TPT","TRC",
+                "TRS","TRV","TTL","TYC","UAK","UPC","UPK","USN","VAL",
+                "VAN","VBS","VGF","VID","VIR","VIS","VNK","VRS","VSH",
+                "VSK","WAL","WAN","WAT","WCK","WCR","WDS","WEB","WEI",
+                "WEN","WHT","WID","WIN","WIS","WIT","WKN","WLD","WLG",
+                "WNO","WOR","WRB","WSH","WTH","WYN","XIA","YAN","YNS",
+                "YSC","ZBS","ZEH","ZIN","ZMN",
+            }
+            if any(code == p or code.startswith(p) for p in DISCOVERER_PREFIXES):
+                self._log(f"Trying discoverer lookup for '{name}'…")
+                wds = search_wds_by_discoverer(name)
+                if wds:
+                    self._set_wds(wds, source=f"discoverer '{name}'")
+                    return
+                else:
+                    self._log(f"  Not found in local catalogs — trying Simbad…")
+
+        # ── Format 3: Simbad name resolution ─────────────────────────────
+        try:
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            from astroquery.simbad import Simbad
+            result = Simbad.query_object(name)
+            if result is None or len(result) == 0:
+                self._log(f"⚠ '{name}' not found in Simbad or local catalogs.")
+                return
+            ra_str  = result["RA"][0]
+            dec_str = result["DEC"][0]
+            coord = SkyCoord(ra=ra_str, dec=dec_str,
+                             unit=(u.hourangle, u.deg), frame="icrs")
+            ra_deg  = float(coord.ra.deg)
+            dec_deg = float(coord.dec.deg)
+            wds = derive_wds_key(ra_deg, dec_deg)
+            self.coord_lbl.setText(
+                f"Coords: {coord.ra.to_string(unit=u.hour, sep=chr(58), precision=1)}  "
+                f"{coord.dec.to_string(sep=chr(58), precision=0, alwayssign=True)}")
+            self._set_wds(wds, source="Simbad")
+        except ImportError:
+            self._log("⚠ astroquery not installed. Run: pip install astroquery")
+        except Exception as e:
+            self._log(f"⚠ Resolution failed: {e}")
+
+    def _set_wds(self, wds_key: str, source: str = ""):
+        """Store WDS key, update labels, fetch catalog data."""
+        self._wds_key = wds_key
+        self.wds_lbl.setText(f"WDS: {wds_key}")
+        self._log(f"✓ WDS key: {wds_key}  (via {source})")
+        # Clear user measurements and reset plot for the new star
+        self._user_meas.clear()
+        self.meas_list.clear()
+        self._fig.clear()
+        self._ax = self._fig.add_subplot(111, projection="polar")
+        self._ax.set_facecolor(PANEL_BG)
+        self._fig.patch.set_facecolor(DARK_BG)
+        self._canvas.draw()
+        self._fetch_catalog_data()
+        self.plot_btn.setEnabled(True)
+
+    def _fetch_catalog_data(self):
+        if not self._wds_key:
+            return
+        # ORB6 ephemeris
+        self._ephem_pts = query_orb6_ephem(self._wds_key)
+        # ORB6 elements
+        self._orb_elem = query_orb6_elements(self._wds_key)
+        # INT4
+        self._int4_data = query_int4(self._wds_key)
+
+        info_parts = []
+        if self._int4_data:
+            n = len(self._int4_data)
+            yr_min = min(r["epoch"] for r in self._int4_data)
+            yr_max = max(r["epoch"] for r in self._int4_data)
+            info_parts.append(f"INT4: {n} measures ({yr_min:.1f}–{yr_max:.1f})")
+        else:
+            info_parts.append("INT4: no data (download catalogs?)")
+        if self._orb_elem:
+            g = self._orb_elem.get("grade", "?")
+            info_parts.append(f"ORB6: orbit found (grade {g})")
+            self._log(f"Raw ORB6 line: {self._orb_elem.get('_raw_line', 'n/a')}")
+            self._log(
+                f"Elements: P={self._orb_elem['P']:.2f}yr a={self._orb_elem['a']:.4f}as i={self._orb_elem['i']:.1f} Omega={self._orb_elem['Omega']:.1f} T={self._orb_elem['T']:.2f} e={self._orb_elem['e']:.3f} omega={self._orb_elem['omega']:.1f}")
+        elif self._ephem_pts:
+            info_parts.append(f"ORB6: ephemeris only ({len(self._ephem_pts)} pts)")
+        else:
+            info_parts.append("ORB6: no orbit")
+        self.info_lbl.setText("\n".join(info_parts))
+
+    # ── User measurements ──────────────────────────────────────────────────
+
+    def _load_json(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Load Speckle Result JSON(s)",
+            _working_dir(),
+            "JSON files (*.json);;All Files (*)")
+        for p in paths:
+            try:
+                with open(p) as f:
+                    d = _json.load(f)
+                # Require minimum fields
+                if "rho_arcsec" not in d or "theta_sky_deg" not in d:
+                    self._log(f"⚠ {Path(p).name}: missing rho/theta fields")
+                    continue
+                d["_source"] = Path(p).name
+                self._user_meas.append(d)
+                self._log(f"✓ Loaded: {Path(p).name}")
+            except Exception as e:
+                self._log(f"⚠ {Path(p).name}: {e}")
+        self._update_meas_list()
+
+    def _clear_meas(self):
+        self._user_meas.clear()
+        self._update_meas_list()
+
+    def _update_meas_list(self):
+        if not self._user_meas:
+            self.meas_list.setPlainText("(none)")
+            return
+        lines = []
+        for m in self._user_meas:
+            rho   = m.get("rho_arcsec", "?")
+            theta = m.get("theta_sky_deg", "?")
+            lines.append(f"{m['_source']}: ρ={rho:.4f}″ θ={theta:.2f}°")
+        self.meas_list.setPlainText("\n".join(lines))
+
+    # ── Plot ───────────────────────────────────────────────────────────────
+
+    def _result_available(self):
+        return bool(self._wds_key and (self._int4_data or self._ephem_pts or self._orb_elem or self._user_meas))
+
+    def _plot(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import datetime
+
+        use_polar = self.polar_btn.isChecked()
+
+        # Rebuild figure with correct projection
+        self._fig.clear()
+        if use_polar:
+            self._ax = self._fig.add_subplot(111, projection="polar")
+        else:
+            self._ax = self._fig.add_subplot(111)
+        ax = self._ax
+        ax.set_facecolor(PANEL_BG)
+
+        if use_polar:
+            ax.set_theta_zero_location("N")
+            ax.set_theta_direction(-1)
+
+        def to_xy(theta_deg, rho):
+            """Convert (theta, rho) to (ΔRA, ΔDec) or polar coords."""
+            th_rad = np.radians(theta_deg)
+            if use_polar:
+                return np.radians(90 - theta_deg), rho
+            else:
+                # ΔRA = rho*sin(theta)  East positive (leftward in plot)
+                # ΔDec = rho*cos(theta) North positive
+                return rho * np.sin(th_rad), rho * np.cos(th_rad)
+
+        plotted_labels = set()
+
+        # ── INT4 historical data ─────────────────────────────────────────
+        if self._int4_data:
+            tech_groups = {}
+            for row in self._int4_data:
+                if row["theta"] is None or row["rho"] is None:
+                    continue
+                lbl = _int4_label(row.get("technique","?"))
+                col = _int4_color(row.get("technique","?"))
+                tech_groups.setdefault(lbl, {"col":col,"thetas":[],"rhos":[],"epochs":[]})
+                tech_groups[lbl]["thetas"].append(row["theta"])
+                tech_groups[lbl]["rhos"].append(row["rho"])
+                tech_groups[lbl]["epochs"].append(row["epoch"])
+
+            for lbl, g in tech_groups.items():
+                thetas = np.array(g["thetas"]); rhos = np.array(g["rhos"])
+                xs, ys = to_xy(thetas, rhos)
+                show_lbl = lbl not in plotted_labels
+                ax.scatter(xs, ys, c=g["col"], s=14, alpha=0.75,
+                           label=lbl if show_lbl else None, zorder=3)
+                plotted_labels.add(lbl)
+
+        # ── ORB6 orbit curve ─────────────────────────────────────────────
+        th_curve = rh_curve = None
+        if self._ephem_pts or self._orb_elem:
+            th_curve, rh_curve = compute_orbit_curve(
+                self._ephem_pts, self._orb_elem, n_pts=360)
+            orb_info = (f"P={self._orb_elem['P']:.1f}yr "
+                        f"a={self._orb_elem['a']:.4f}as "
+                        f"i={self._orb_elem['i']:.0f} "
+                        f"e={self._orb_elem['e']:.3f}") if self._orb_elem else "ephem-only"
+            self._log(f"Orbit curve: {len(th_curve)} pts rho={rh_curve.min():.3f}-{rh_curve.max():.3f} [{orb_info}]")
+            xs_c, ys_c = to_xy(th_curve, rh_curve)
+            # Close the curve
+            xs_c = np.append(xs_c, xs_c[0]); ys_c = np.append(ys_c, ys_c[0])
+            ax.plot(xs_c, ys_c, color=ACCENT, lw=2.0, label="ORB6 orbit", zorder=4)
+
+            # Current epoch marker from ephemeris
+            cur_yr = datetime.date.today().year + datetime.date.today().timetuple().tm_yday/365.25
+            if self._ephem_pts:
+                years = [p[0] for p in self._ephem_pts]
+                idx   = int(np.argmin(np.abs(np.array(years) - cur_yr)))
+                th_now, rh_now = self._ephem_pts[idx][1], self._ephem_pts[idx][2]
+                xn, yn = to_xy(th_now, rh_now)
+                ax.scatter([xn], [yn], c=ACCENT, s=120, marker="*",
+                           label=f"Predicted {years[idx]:.0f}", zorder=6)
+
+        # ── User measurements ─────────────────────────────────────────────
+        first_user = True
+        for m in self._user_meas:
+            rho   = m.get("rho_arcsec"); theta = m.get("theta_sky_deg")
+            if rho is None or theta is None: continue
+            sig_rho   = m.get("sigma_rho_total_arcsec", 0) or 0
+            sig_theta = m.get("sigma_theta_total_deg",  0) or 0  # degrees
+            xm, ym    = to_xy(theta, rho)
+            lbl = "Your measurement" if first_user else None
+            first_user = False
+            ax.scatter([xm], [ym], c="#f85149", s=40, marker="o",
+                       zorder=7, label=lbl)
+
+            if use_polar:
+                # In polar (theta_plot = 90-theta, rho): error bars along
+                # the rho axis (radial) for sig_rho, and along the arc for sig_theta
+                th_rad = np.radians(90 - theta)
+                if sig_rho > 0:
+                    ax.errorbar([th_rad], [rho],
+                                yerr=[[sig_rho], [sig_rho]],
+                                fmt="none", ecolor="#f85149",
+                                elinewidth=1.5, capsize=3, zorder=7)
+                if sig_theta > 0 and rho > 0:
+                    sig_th_rad = np.radians(sig_theta)
+                    ax.errorbar([th_rad], [rho],
+                                xerr=[[sig_th_rad], [sig_th_rad]],
+                                fmt="none", ecolor="#f85149",
+                                elinewidth=1.5, capsize=3, zorder=7)
+            else:
+                # Cartesian: propagate (sig_rho, sig_theta) → (sig_dRA, sig_dDec)
+                # dRA = rho*sin(theta), dDec = rho*cos(theta)
+                # sig_dRA  = sqrt((cos(theta)*rho*sig_theta_rad)^2 + (sin(theta)*sig_rho)^2)
+                # sig_dDec = sqrt((sin(theta)*rho*sig_theta_rad)^2 + (cos(theta)*sig_rho)^2)
+                th_r = np.radians(theta)
+                sig_th_r = np.radians(sig_theta)
+                if sig_rho > 0 or sig_theta > 0:
+                    sig_dRA  = float(np.hypot(np.cos(th_r)*rho*sig_th_r,
+                                               np.sin(th_r)*sig_rho))
+                    sig_dDec = float(np.hypot(np.sin(th_r)*rho*sig_th_r,
+                                               np.cos(th_r)*sig_rho))
+                    ax.errorbar([xm], [ym],
+                                xerr=[[sig_dRA],  [sig_dRA]],
+                                yerr=[[sig_dDec], [sig_dDec]],
+                                fmt="none", ecolor="#f85149",
+                                elinewidth=1.5, capsize=3, zorder=7)
+
+        # ── Styling ───────────────────────────────────────────────────────
+        # Orbit solution reference from raw line
+        ref_str = ""
+        if self._orb_elem and self._orb_elem.get("_raw_line"):
+            raw = self._orb_elem["_raw_line"]
+            # Extract reference code (last alphabetic token before .png or end)
+            import re
+            refs = re.findall(r"([A-Z][a-z]+\d{4}[a-z]?)", raw)
+            if refs:
+                ref_str = f"  [{refs[-1]}]"
+
+        grade_str = f"  grade {self._orb_elem['grade']}" if (self._orb_elem and self._orb_elem.get("grade")) else ""
+        ax.set_title(
+            f"{self._wds_key or '—'}{grade_str}{ref_str}",
+            color=TEXT_PRIMARY, pad=12, fontsize=11)
+
+        if use_polar:
+            ax.tick_params(colors=TEXT_MUTED, labelsize=8)
+            ax.spines["polar"].set_color(BORDER_COLOR)
+            ax.grid(color=BORDER_COLOR, linewidth=0.5)
+            ax.set_rlabel_position(45)
+            for lbl in ax.get_yticklabels(): lbl.set_color(TEXT_MUTED); lbl.set_fontsize(7)
+            for lbl in ax.get_xticklabels(): lbl.set_color(TEXT_MUTED); lbl.set_fontsize(8)
+        else:
+            ax.set_xlabel("ΔRA (arcsec, E→right)", color=TEXT_MUTED, fontsize=9)
+            ax.set_ylabel("ΔDec (arcsec, N→up)", color=TEXT_MUTED, fontsize=9)
+            ax.tick_params(colors=TEXT_MUTED, labelsize=8)
+            ax.spines["bottom"].set_color(BORDER_COLOR)
+            ax.spines["left"].set_color(BORDER_COLOR)
+            ax.spines["top"].set_color(BORDER_COLOR)
+            ax.spines["right"].set_color(BORDER_COLOR)
+            ax.grid(color=BORDER_COLOR, linewidth=0.5, alpha=0.5)
+            # Mark primary star at origin
+            ax.scatter([0], [0], c=WARNING, s=80, marker="+", zorder=8,
+                       linewidths=2.5, label="Primary")
+            # Compass annotation
+            ax.annotate("N", xy=(0.05, 0.95), xycoords="axes fraction",
+                        color=TEXT_MUTED, fontsize=8, ha="center")
+            ax.annotate("E", xy=(0.95, 0.05), xycoords="axes fraction",
+                        color=TEXT_MUTED, fontsize=8, ha="center")
+            ax.set_aspect("equal")
+
+        # Scale
+        candidate_rhos = []
+        # Use actual orbit curve max rho (not analytical a*(1+e) which is wrong
+        # after the Heintz X,Y convention fix)
+        if th_curve is not None and len(rh_curve) > 0:
+            candidate_rhos.append(float(rh_curve.max()))
+        if self._user_meas:
+            candidate_rhos.extend(m["rho_arcsec"] for m in self._user_meas if m.get("rho_arcsec"))
+        if self._ephem_pts:
+            candidate_rhos.extend(p[2] for p in self._ephem_pts)
+        if self._int4_data:
+            rhos_int4 = [r["rho"] for r in self._int4_data if r["rho"]]
+            if rhos_int4:
+                candidate_rhos.append(float(np.percentile(rhos_int4, 90)))
+        max_rho = max(candidate_rhos) if candidate_rhos else 1.0
+        if use_polar:
+            ax.set_ylim(0, max_rho / 0.88)
+        else:
+            lim = max_rho / 0.82
+            ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+
+        if plotted_labels or self._ephem_pts or self._user_meas:
+            ax.legend(loc="upper right", bbox_to_anchor=(1.38, 1.12),
+                      fontsize=8, framealpha=0.5,
+                      facecolor=PANEL_BG, edgecolor=BORDER_COLOR,
+                      labelcolor=TEXT_PRIMARY)
+
+        # ── Inset zoom around user measurements ───────────────────────────
+        user_valid = [(m["rho_arcsec"], m["theta_sky_deg"])
+                      for m in self._user_meas
+                      if m.get("rho_arcsec") is not None
+                      and m.get("theta_sky_deg") is not None]
+        if user_valid and not use_polar:
+            # Inset: lower-right corner, aligned with legend left edge
+            # Matches main plot mode (polar or Cartesian)
+            inset = self._fig.add_axes([0.80, 0.10, 0.17, 0.17])
+
+            # Compute mean user position in native plot coords via to_xy
+            rhos_u   = np.array([v[0] for v in user_valid])
+            thetas_u = np.array([v[1] for v in user_valid])
+            xys_u    = [to_xy(t, r) for t, r in zip(thetas_u, rhos_u)]
+            cx = float(np.mean([xy[0] for xy in xys_u]))
+            cy = float(np.mean([xy[1] for xy in xys_u]))
+
+            # zoom radius: 4× max sigma_rho, clipped 0.05"–0.35"
+            sig_rhos = [m.get("sigma_rho_total_arcsec", 0) or 0
+                        for m in self._user_meas if m.get("rho_arcsec") is not None]
+            zoom_r   = float(np.clip((max(sig_rhos) if sig_rhos else 0) * 4,
+                                     0.05, 0.35))
+
+            # ── Orbit curve in inset ──────────────────────────────────────
+            if th_curve is not None:
+                xs_o, ys_o = to_xy(th_curve, rh_curve)
+                inset.plot(xs_o, ys_o, color=ACCENT, lw=1.5, zorder=3)
+
+            # ── INT4 points in inset ──────────────────────────────────────
+            if self._int4_data:
+                for row in self._int4_data:
+                    if row["theta"] is None or row["rho"] is None: continue
+                    xi, yi = to_xy(row["theta"], row["rho"])
+                    inset.scatter([xi], [yi],
+                                  c=_int4_color(row.get("technique", "?")),
+                                  s=8, alpha=0.7, zorder=3)
+
+            # ── Ephemeris marker in inset ─────────────────────────────────
+            if self._ephem_pts:
+                years = [p[0] for p in self._ephem_pts]
+                idx   = int(np.argmin(np.abs(np.array(years) - cur_yr)))
+                xe, ye = to_xy(self._ephem_pts[idx][1], self._ephem_pts[idx][2])
+                inset.scatter([xe], [ye], c=ACCENT, s=60, marker="*", zorder=5)
+
+            # ── User measurements with error bars in inset ────────────────
+            for m in self._user_meas:
+                rho_m   = m.get("rho_arcsec"); theta_m = m.get("theta_sky_deg")
+                if rho_m is None or theta_m is None: continue
+                sig_rho_m   = m.get("sigma_rho_total_arcsec", 0) or 0
+                sig_theta_m = m.get("sigma_theta_total_deg",  0) or 0
+                xm_i, ym_i  = to_xy(theta_m, rho_m)
+                inset.scatter([xm_i], [ym_i], c="#f85149", s=30,
+                              marker="o", zorder=7)
+                th_r_m   = np.radians(theta_m)
+                sig_th_r = np.radians(sig_theta_m)
+                sig_dRA  = float(np.hypot(np.cos(th_r_m)*rho_m*sig_th_r,
+                                              np.sin(th_r_m)*sig_rho_m))
+                sig_dDec = float(np.hypot(np.sin(th_r_m)*rho_m*sig_th_r,
+                                          np.cos(th_r_m)*sig_rho_m))
+                if sig_rho_m > 0 or sig_theta_m > 0:
+                    inset.errorbar([xm_i], [ym_i],
+                                   xerr=[[sig_dRA],  [sig_dRA]],
+                                   yerr=[[sig_dDec], [sig_dDec]],
+                                   fmt="none", ecolor="#f85149",
+                                   elinewidth=1.2, capsize=2, zorder=7)
+
+            # ── Inset zoom limits and styling ─────────────────────────────
+            inset.set_facecolor(PANEL_BG)
+            inset.tick_params(colors=TEXT_MUTED, labelsize=5)
+            for sp in inset.spines.values():
+                sp.set_edgecolor("#f85149"); sp.set_linewidth(1.2)
+            inset.set_xlim(cx - zoom_r, cx + zoom_r)
+            inset.set_ylim(cy - zoom_r, cy + zoom_r)
+            inset.set_xlabel("ΔRA\"", color=TEXT_MUTED, fontsize=5, labelpad=1)
+            inset.set_ylabel("ΔDec\"", color=TEXT_MUTED, fontsize=5, labelpad=1)
+            inset.axhline(cy, color=TEXT_MUTED, lw=0.4, alpha=0.4)
+            inset.axvline(cx, color=TEXT_MUTED, lw=0.4, alpha=0.4)
+            inset.set_title("Zoom", color=TEXT_MUTED, fontsize=6, pad=2,
+                            style="italic")
+
+        self._fig.patch.set_facecolor(DARK_BG)
+        # tight_layout conflicts with manually-placed inset; use subplots_adjust
+        try:
+            self._fig.tight_layout(rect=[0, 0, 0.90, 1.0])
+        except Exception:
+            pass
+        self._canvas.draw()
+        self._log(f"Plot updated — {len(self._int4_data)} INT4 points, "
+                  f"{'orbit' if (self._ephem_pts or self._orb_elem) else 'no orbit'}, "
+                  f"{len(self._user_meas)} your measurement(s).")
+
+    def _log(self, msg: str):
+        self.log_edit.append(
+            f'<span style="color:{TEXT_MUTED}">{msg}</span>')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
