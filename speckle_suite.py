@@ -829,8 +829,8 @@ def _parse_declination_from_txt(ser_path: str) -> Optional[float]:
     except OSError:
         return None
 
-    # Key pattern: dec / declination / de / δ  (case-insensitive)
-    key_pat = r'(?:declination|decl?|de|δ)'
+    # Key pattern: dec / declination / de / δ  (case-insensitive, whole word only)
+    key_pat = r'(?<!\w)(?:declination|decl?|de|δ)(?!\w)'
 
     # Value patterns for the coordinate part
     # 1.  ±DD°MM′SS.s″   or  ±DD°MM'SS.s"
@@ -1386,14 +1386,9 @@ class DriftTab(QWidget):
         dec_lbl.setStyleSheet(f"color: {TEXT_MUTED};")
         dec_lbl.setToolTip("Declination of the drift star (degrees)")
 
-        self.dec_spin = QDoubleSpinBox()
-        self.dec_spin.setRange(-90.0, 90.0)
-        self.dec_spin.setValue(45.0)
-        self.dec_spin.setSuffix(" °")
-        self.dec_spin.setDecimals(4)
-        self.dec_spin.setSpecialValueText("")
-        self.dec_spin.lineEdit().setReadOnly(False)
-        self.dec_spin.installEventFilter(self)
+        self.dec_spin = QLineEdit()
+        self.dec_spin.setPlaceholderText("e.g. +45.0")
+        self.dec_spin.setMinimumHeight(26)
         self.dec_spin.setToolTip("Declination of the drift star (degrees)")
 
         self.dec_auto_lbl = QLabel("")
@@ -1682,7 +1677,7 @@ class DriftTab(QWidget):
         self.start_slider.valueChanged.connect(self._on_trim_slider_moved)
         self.stop_slider.valueChanged.connect(self._on_trim_slider_moved)
         self.sigma_slider.valueChanged.connect(self._on_sigma_changed)
-        self.dec_spin.valueChanged.connect(self._on_dec_manually_edited)
+        self.dec_spin.textChanged.connect(lambda _: self._on_dec_manually_edited())
 
         root.addWidget(right)
 
@@ -1763,7 +1758,7 @@ class DriftTab(QWidget):
         """Simbad returned a result — fill in the declination."""
         self._dec_auto_filled = True
         self.dec_spin.blockSignals(True)
-        self.dec_spin.setValue(dec_deg)
+        self.dec_spin.setText(f"{dec_deg:+.4f}")
         self.dec_spin.blockSignals(False)
         self._update_dec_label('simbad')
         self._log(f"Simbad: {main_id}  →  δ = {dec_deg:+.4f}°")
@@ -1841,7 +1836,7 @@ class DriftTab(QWidget):
             # ── Try companion text file for declination ────────────────
             dec_found = _parse_declination_from_txt(path)
             if dec_found is not None:
-                self.dec_spin.setValue(dec_found)
+                self.dec_spin.setText(f"{dec_found:+.4f}")
                 self._dec_auto_filled = True
                 self._log(f"  Declination auto-filled from companion file: {dec_found:+.4f}°")
                 self._update_dec_label('file')
@@ -1905,7 +1900,7 @@ class DriftTab(QWidget):
     def _launch_drift_worker(self, path: str):
         self.worker = DriftWorker(
             filepath        = path,
-            declination_deg = self.dec_spin.value(),
+            declination_deg = float(self.dec_spin.text()) if self.dec_spin.text().strip() else 0.0,
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.status.connect(self._on_status)
@@ -1934,15 +1929,24 @@ class DriftTab(QWidget):
         self._nav_idx = idx
         self._update_drift_nav()
         path = self._nav_paths[idx]
-        raw  = self._nav_memory.get(path)
-        if raw is None:
+        mem  = self._nav_memory.get(path)
+        if mem is None:
             return
+        # Unwrap structured entry {"raw": ..., "sigma": ..., "start": ..., "stop": ...}
+        raw = mem["raw"] if "raw" in mem else mem
         self._raw_data = raw
         self.file_edit.setText(path)
         dur = raw['times_sec'][-1] - raw['times_sec'][0]
         max_val = max(1, int(dur * 10) // 2)
         self.start_slider.setRange(0, max_val)
         self.stop_slider.setRange(0, max_val)
+        # Restore per-file slider values if available
+        if "sigma" in mem:
+            self.sigma_slider.setValue(mem["sigma"])
+        if "start" in mem:
+            self.start_slider.setValue(mem["start"])
+        if "stop" in mem:
+            self.stop_slider.setValue(mem["stop"])
         self._log(f"◄► {Path(path).name}")
         self._recompute()
 
@@ -1953,6 +1957,31 @@ class DriftTab(QWidget):
     def _drift_nav_next(self):
         if self._nav_idx < len(self._nav_paths) - 1:
             self._drift_nav_go(self._nav_idx + 1)
+
+    def _drift_nav_save_sliders(self):
+        """Snapshot the current file's live slider values back into _nav_memory.
+        Called before batch JSON export to ensure the currently-displayed file's
+        tuned sigma/start/stop values are captured before iterating all entries.
+        Also upgrades any legacy bare-raw entries to the expected dict structure.
+        """
+        if not self._nav_paths or self._nav_idx >= len(self._nav_paths):
+            return
+        path = self._nav_paths[self._nav_idx]
+        if path not in self._nav_memory:
+            return
+        mem = self._nav_memory[path]
+        # Upgrade legacy format: entry was stored as bare raw dict
+        if "raw" not in mem:
+            self._nav_memory[path] = {
+                "raw":   mem,
+                "sigma": self.sigma_slider.value(),
+                "start": self.start_slider.value(),
+                "stop":  self.stop_slider.value(),
+            }
+        else:
+            mem["sigma"] = self.sigma_slider.value()
+            mem["start"] = self.start_slider.value()
+            mem["stop"]  = self.stop_slider.value()
 
     def _kill_worker(self):
         if self.worker and self.worker.isRunning():
@@ -1987,7 +2016,12 @@ class DriftTab(QWidget):
         if self._nav_pending:
             # Batch mode: store and continue
             path = self._nav_pending.pop(0)
-            self._nav_memory[path] = raw
+            self._nav_memory[path] = {
+                "raw":   raw,
+                "sigma": self.sigma_slider.value(),
+                "start": self.start_slider.value(),
+                "stop":  self.stop_slider.value(),
+            }
             done = len(self._nav_paths) - len(self._nav_pending)
             self._log(f"  [{done}/{len(self._nav_paths)}] {Path(path).name} ✓")
             if self._nav_pending:
@@ -2053,7 +2087,7 @@ class DriftTab(QWidget):
         fit   = fit_drift(
             self._raw_data['centroids_x'],
             self._raw_data['centroids_y'],
-            self.dec_spin.value(),          # always use current spinbox value
+            float(self.dec_spin.text()) if self.dec_spin.text().strip() else 0.0,
             self._raw_data['fps'],
             sigma,
             times_sec      = self._raw_data.get('times_sec'),
@@ -2262,8 +2296,10 @@ class DriftTab(QWidget):
                 f"f/{fr:.1f}" if fr is not None else "— (no aperture)")
             if sampling is not None:
                 self.sampling_value_lbl.setText(f"{sampling:.2f}")
+                print(f"DEBUG set sampling label to: {sampling:.2f}, label now reads: {self.sampling_value_lbl.text()}")
             else:
                 self.sampling_value_lbl.setText("—")
+            self.sampling_value_lbl.repaint()
 
     def _fit_from_memory(self, mem: dict):
         """Re-run fit for a nav_memory entry using its stored slider values."""
@@ -3470,8 +3506,12 @@ class AnalysisTab(QWidget):
         self._csv_path:   str   = ""
         self._meas_rho_sky:    Optional[float] = None
         self._meas_theta_sky:  Optional[float] = None
-        self._meas_sigma_rho:  float = 0.0
-        self._meas_sigma_theta: float = 0.0
+        # Calibration-propagated uncertainties (from drift σ_scale, σ_angle)
+        self._meas_sigma_rho_cal:   float = 0.0
+        self._meas_sigma_theta_cal: float = 0.0
+        # Measurement scatter uncertainties (std across multiple NPZ results)
+        self._meas_sigma_rho_meas:   float = 0.0
+        self._meas_sigma_theta_meas: float = 0.0
         # batch
         self._queue:        list = []
         self._queue_total:  int  = 0
@@ -3687,7 +3727,11 @@ class AnalysisTab(QWidget):
                 pm = QLabel("±"); pm.setFixedWidth(12)
                 pm.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 err = QDoubleSpinBox()
-                err.setRange(0, hi); err.setDecimals(decimals)
+                # Use at least 8 decimal places for error spinboxes so that
+                # small sigma values (e.g. 0.000004 arcsec/px) are not
+                # silently rounded to 0.0 on setValue.
+                err_decimals = max(decimals + 2, 8)
+                err.setRange(0, hi); err.setDecimals(err_decimals)
                 err.setValue(0.0); err.setMinimumHeight(24)
                 row.addWidget(pm); row.addWidget(err, 1)
             return row_w, spin, err
@@ -4466,6 +4510,33 @@ class AnalysisTab(QWidget):
         if self._nav_paths:
             self._nav_save_current()
 
+    def _compute_measurement_scatter(self) -> tuple[float, float]:
+        """
+        Compute std of ρ (arcsec) and θ_sky (deg) across all NPZ files
+        that have both markers placed and calibration available.
+        Returns (sigma_rho_meas, sigma_theta_meas) — both 0.0 when fewer
+        than 2 complete measurements exist.
+        """
+        scale = self.cal_scale_spin.value()
+        angle = self.cal_angle_spin.value()
+        if scale <= 0 or not self._nav_memory:
+            return 0.0, 0.0
+        rhos, thetas = [], []
+        for mem in self._nav_memory.values():
+            pp = mem.get('primary_pos')
+            cp = mem.get('companion_pos')
+            if pp is None or cp is None:
+                continue
+            dx = cp[0] - pp[0]
+            dy = cp[1] - pp[1]
+            rho_px  = float(np.hypot(dx, dy))
+            theta_img = float(np.degrees(np.arctan2(dx, -dy))) % 360.0
+            rhos.append(rho_px * scale)
+            thetas.append((theta_img + angle) % 360.0)
+        if len(rhos) < 2:
+            return 0.0, 0.0
+        return float(np.std(rhos, ddof=1)), float(np.std(thetas, ddof=1))
+
     def _update_measurement(self):
         if self._primary_pos is None or self._companion_pos is None:
             self.card_theta.set_value("—")
@@ -4497,28 +4568,44 @@ class AnalysisTab(QWidget):
             theta_sky   = (theta + angle) % 360.0
             sigma_scale = self.cal_scale_err.value() if self.cal_scale_err else 0.0
             sigma_angle = self.cal_angle_err.value() if self.cal_angle_err else 0.0
-            sigma_rho   = rho * sigma_scale
-            sigma_theta = sigma_angle
-            self._meas_rho_sky     = rho_arcsec
-            self._meas_theta_sky   = theta_sky
-            self._meas_sigma_rho   = sigma_rho
-            self._meas_sigma_theta = sigma_theta
-            sig_rho_str   = f"{sigma_rho:.4f}"   if sigma_rho   > 0 else None
-            sig_theta_str = f"{sigma_theta:.2f}" if sigma_theta > 0 else None
+            # Calibration-propagated uncertainty
+            sigma_rho_cal   = rho * sigma_scale
+            sigma_theta_cal = sigma_angle
+            # Measurement scatter across all marked NPZ files
+            sigma_rho_meas, sigma_theta_meas = self._compute_measurement_scatter()
+            self._meas_rho_sky          = rho_arcsec
+            self._meas_theta_sky        = theta_sky
+            self._meas_sigma_rho_cal    = sigma_rho_cal
+            self._meas_sigma_theta_cal  = sigma_theta_cal
+            self._meas_sigma_rho_meas   = sigma_rho_meas
+            self._meas_sigma_theta_meas = sigma_theta_meas
+            sig_rho_str   = f"{sigma_rho_cal:.4f}"   if sigma_rho_cal   > 0 else None
+            sig_theta_str = f"{sigma_theta_cal:.2f}" if sigma_theta_cal > 0 else None
             self.card_rho_sky.set_value(f"{rho_arcsec:.4f}",  sig_rho_str)
             self.card_theta_sky.set_value(f"{theta_sky:.2f}", sig_theta_str)
+            n_meas = sum(
+                1 for m in self._nav_memory.values()
+                if m.get('primary_pos') and m.get('companion_pos')
+            )
+            scatter_str = (
+                f"  scatter({n_meas}): ρ±{sigma_rho_meas:.4f}″ θ±{sigma_theta_meas:.2f}°"
+                if n_meas >= 2 else ""
+            )
             self._log(
                 f"Primary→Companion  ρ = {rho:.2f} px  ({rho_arcsec:.4f}″"
-                + (f" ±{sigma_rho:.4f}" if sigma_rho > 0 else "") + ")"
+                + (f" ±{sigma_rho_cal:.4f}[cal]" if sigma_rho_cal > 0 else "") + ")"
                 + f"   θ = {theta:.2f}° img  ({theta_sky:.2f}°"
-                + (f" ±{sigma_theta:.2f}" if sigma_theta > 0 else "") + "° sky)")
+                + (f" ±{sigma_theta_cal:.2f}[cal]" if sigma_theta_cal > 0 else "") + "° sky)"
+                + scatter_str)
         else:
             self.card_theta_sky.set_value("—")
             self.card_rho_sky.set_value("—")
-            self._meas_rho_sky   = None
-            self._meas_theta_sky = None
-            self._meas_sigma_rho   = 0.0
-            self._meas_sigma_theta = 0.0
+            self._meas_rho_sky          = None
+            self._meas_theta_sky        = None
+            self._meas_sigma_rho_cal    = 0.0
+            self._meas_sigma_theta_cal  = 0.0
+            self._meas_sigma_rho_meas   = 0.0
+            self._meas_sigma_theta_meas = 0.0
             self._log(
                 f"Primary→Companion  ρ = {rho:.2f} px   θ = {theta:.2f}°  "
                 f"(load calibration for sky coords)")
@@ -4611,8 +4698,13 @@ class AnalysisTab(QWidget):
 
             scale = cal['pixel_scale_arcsec']
             angle = cal['camera_angle_deg']
-            s_sc  = cal.get('sigma_scale_arcsec', 0.0)
-            s_ang = cal.get('sigma_angle_deg',    0.0)
+            # Single-file JSON uses sigma_scale_arcsec / sigma_angle_deg.
+            # Batch JSON uses pixel_scale_std_arcsec / camera_angle_std_deg.
+            # Accept either, preferring the sigma_ keys when both are present.
+            s_sc  = cal.get('sigma_scale_arcsec',
+                    cal.get('pixel_scale_std_arcsec', 0.0))
+            s_ang = cal.get('sigma_angle_deg',
+                    cal.get('camera_angle_std_deg',   0.0))
 
             self.cal_scale_spin.setValue(scale)
             self.cal_angle_spin.setValue(angle)
@@ -4646,22 +4738,37 @@ class AnalysisTab(QWidget):
         if not path:
             return
         payload = {
-            "rho_px":             round(self._meas_rho,   4),
-            "theta_img_deg":      round(self._meas_theta, 4),
-            "rho_arcsec":         round(self._meas_rho_sky,   6)
-                                  if self._meas_rho_sky   is not None else None,
-            "theta_sky_deg":      round(self._meas_theta_sky, 4)
-                                  if self._meas_theta_sky is not None else None,
-            "sigma_rho_arcsec":   round(self._meas_sigma_rho,   6),
-            "sigma_theta_deg":    round(self._meas_sigma_theta, 4),
-            "pixel_scale_arcsec": self.cal_scale_spin.value(),
-            "camera_angle_deg":   self.cal_angle_spin.value(),
-            "cal_file":           Path(self._cal_file).name
-                                  if self._cal_file else "manual",
-            "roi_size_px":        int(r.get('roi_size', 0)),
-            "n_frames":           int(r.get('n_frames', 0)),
-            "fits_source":        Path(self.file_edit.text()).name
-                                  if self.file_edit.text() else "",
+            "rho_px":                    round(self._meas_rho,   4),
+            "theta_img_deg":             round(self._meas_theta, 4),
+            "rho_arcsec":                round(self._meas_rho_sky,   6)
+                                         if self._meas_rho_sky   is not None else None,
+            "theta_sky_deg":             round(self._meas_theta_sky, 4)
+                                         if self._meas_theta_sky is not None else None,
+            # Calibration-propagated uncertainties (σ_scale, σ_angle from drift)
+            "sigma_rho_cal_arcsec":      round(self._meas_sigma_rho_cal,   6),
+            "sigma_theta_cal_deg":       round(self._meas_sigma_theta_cal, 4),
+            # Measurement scatter uncertainties (std across NPZ batch, ddof=1)
+            # 0.0 when fewer than 2 measurements are marked
+            "sigma_rho_meas_arcsec":     round(self._meas_sigma_rho_meas,   6),
+            "sigma_theta_meas_deg":      round(self._meas_sigma_theta_meas, 4),
+            # Combined uncertainty (quadrature sum of cal + measurement scatter)
+            "sigma_rho_total_arcsec":    round(float(np.hypot(
+                                             self._meas_sigma_rho_cal,
+                                             self._meas_sigma_rho_meas)),   6),
+            "sigma_theta_total_deg":     round(float(np.hypot(
+                                             self._meas_sigma_theta_cal,
+                                             self._meas_sigma_theta_meas)), 4),
+            "n_measurements":            sum(
+                1 for m in self._nav_memory.values()
+                if m.get('primary_pos') and m.get('companion_pos')),
+            "pixel_scale_arcsec":        self.cal_scale_spin.value(),
+            "camera_angle_deg":          self.cal_angle_spin.value(),
+            "cal_file":                  Path(self._cal_file).name
+                                         if self._cal_file else "manual",
+            "roi_size_px":               int(r.get('roi_size', 0)),
+            "n_frames":                  int(r.get('n_frames', 0)),
+            "fits_source":               Path(self.file_edit.text()).name
+                                         if self.file_edit.text() else "",
         }
         try:
             with open(path, 'w') as f:
@@ -4677,8 +4784,9 @@ class AnalysisTab(QWidget):
 
     _CSV_HEADER = [
         'date', 'target', 'observer', 'filter',
-        'theta_sky_deg', 'sigma_theta_deg',
-        'rho_arcsec', 'sigma_rho_arcsec',
+        'theta_sky_deg', 'sigma_theta_cal_deg', 'sigma_theta_meas_deg',
+        'rho_arcsec',    'sigma_rho_cal_arcsec', 'sigma_rho_meas_arcsec',
+        'n_measurements',
         'theta_img_deg', 'rho_px',
         'pixel_scale_arcsec_px', 'sigma_scale',
         'camera_angle_deg', 'sigma_angle_deg',
@@ -4711,11 +4819,18 @@ class AnalysisTab(QWidget):
             self._set_csv_dialog()
             if not self._csv_path:
                 return
-        r = self._result or {}
+        n_meas = sum(
+            1 for m in self._nav_memory.values()
+            if m.get('primary_pos') and m.get('companion_pos'))
         row = [
             date.today().isoformat(), "", "", "",
-            f"{self._meas_theta_sky:.6f}", f"{self._meas_sigma_theta:.6f}",
-            f"{self._meas_rho_sky:.6f}",   f"{self._meas_sigma_rho:.6f}",
+            f"{self._meas_theta_sky:.6f}",
+            f"{self._meas_sigma_theta_cal:.6f}",
+            f"{self._meas_sigma_theta_meas:.6f}",
+            f"{self._meas_rho_sky:.6f}",
+            f"{self._meas_sigma_rho_cal:.6f}",
+            f"{self._meas_sigma_rho_meas:.6f}",
+            str(n_meas),
             f"{self._meas_theta:.4f}",     f"{self._meas_rho:.4f}",
             f"{self.cal_scale_spin.value():.8f}",
             f"{self.cal_scale_err.value():.8f}",
@@ -4739,16 +4854,21 @@ class AnalysisTab(QWidget):
   Date            : {obs_date}
   Filter          : {filter_name}
 
-  Position Angle  : {theta_sky:.2f}°  ± {sigma_theta:.2f}°
-  Separation      : {rho_arcsec:.4f}″  ± {sigma_rho:.4f}″
+  Position Angle  : {theta_sky:.2f}°
+    ± {sigma_theta_cal:.4f}°  (calibration)
+    ± {sigma_theta_meas:.4f}°  (measurement scatter, N={n_measurements})
+
+  Separation      : {rho_arcsec:.4f}″
+    ± {sigma_rho_cal:.4f}″  (calibration)
+    ± {sigma_rho_meas:.4f}″  (measurement scatter, N={n_measurements})
 
   ─── Source measurements ──────────────────────────
   ρ (pixels)      : {rho_px:.3f}
   θ (image)       : {theta_img:.2f}°
 
   ─── Calibration ──────────────────────────────────
-  Pixel scale     : {pixel_scale:.6f} ″/px  ± {sigma_scale:.6f}
-  Camera angle    : {camera_angle:.4f}°  ± {sigma_angle:.4f}°
+  Pixel scale     : {pixel_scale:.6f} ″/px  ± {sigma_scale:.8f}
+  Camera angle    : {camera_angle:.4f}°  ± {sigma_angle:.6f}°
   Calibration file: {cal_file}
 ────────────────────────────────────────────────────
 """
@@ -4757,23 +4877,29 @@ class AnalysisTab(QWidget):
         if self._meas_rho_sky is None:
             self._log("⚠ Load calibration first.", error=True)
             return
+        n_meas = sum(
+            1 for m in self._nav_memory.values()
+            if m.get('primary_pos') and m.get('companion_pos'))
         report = self._WDS_TEMPLATE.format(
-            target       = "",
-            observer     = "",
-            obs_date     = date.today().isoformat(),
-            filter_name  = "",
-            theta_sky    = self._meas_theta_sky,
-            sigma_theta  = self._meas_sigma_theta,
-            rho_arcsec   = self._meas_rho_sky,
-            sigma_rho    = self._meas_sigma_rho,
-            rho_px       = self._meas_rho,
-            theta_img    = self._meas_theta,
-            pixel_scale  = self.cal_scale_spin.value(),
-            sigma_scale  = self.cal_scale_err.value(),
-            camera_angle = self.cal_angle_spin.value(),
-            sigma_angle  = self.cal_angle_err.value(),
-            cal_file     = Path(self._cal_file).name
-                           if self._cal_file else "manual",
+            target          = "",
+            observer        = "",
+            obs_date        = date.today().isoformat(),
+            filter_name     = "",
+            theta_sky       = self._meas_theta_sky,
+            sigma_theta_cal = self._meas_sigma_theta_cal,
+            sigma_theta_meas= self._meas_sigma_theta_meas,
+            rho_arcsec      = self._meas_rho_sky,
+            sigma_rho_cal   = self._meas_sigma_rho_cal,
+            sigma_rho_meas  = self._meas_sigma_rho_meas,
+            n_measurements  = n_meas,
+            rho_px          = self._meas_rho,
+            theta_img       = self._meas_theta,
+            pixel_scale     = self.cal_scale_spin.value(),
+            sigma_scale     = self.cal_scale_err.value(),
+            camera_angle    = self.cal_angle_spin.value(),
+            sigma_angle     = self.cal_angle_err.value(),
+            cal_file        = Path(self._cal_file).name
+                              if self._cal_file else "manual",
         )
         fits_stem = (Path(self.file_edit.text()).stem
                      if self.file_edit.text() else "result")
