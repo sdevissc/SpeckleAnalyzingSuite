@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QGroupBox, QFileDialog, QTextEdit, QButtonGroup,
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt
 
 import speckle_suite.theme as theme
 from speckle_suite.settings import working_dir
@@ -109,6 +110,7 @@ class HistoryTab(QWidget):
         mg.addLayout(mb_row)
         mg.addWidget(self.meas_list)
         lv.addWidget(meas_group)
+
 
         cat_group = QGroupBox("Catalogs")
         cg = QVBoxLayout(cat_group)

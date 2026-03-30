@@ -1328,6 +1328,7 @@ class AstrometryTab(QWidget):
             "camera_angle_deg":   self.cal_angle_spin.value(),
             "cal_file":           Path(self._cal_file).name if self._cal_file else "manual",
             "npz_source":         Path(self._npz_path).name if self._npz_path else "",
+            "recon_size_px":      int(self._recon.shape[0]) if self._recon is not None else None,
         }
         try:
             with open(path, 'w') as f:
